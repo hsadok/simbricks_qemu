@@ -584,14 +584,23 @@ static void simbricks_config_write(PCIDevice *dev,
 {
     SimbricksPciState *simbricks = SIMBRICKS_PCI(dev);
     volatile union SimbricksProtoPcieH2D *msg;
-    volatile struct SimbricksProtoPcieH2DDevctrl *devctrl;
     bool intx_before, intx_after;
     bool msi_before, msi_after;
     bool msix_before, msix_after;
+    struct SimbricksProtoPcieH2DDevctrl devctrl = {0};
+    uint64_t bars_before[SIMBRICKS_PROTO_PCIE_NBARS];
+    uint64_t bars_after[SIMBRICKS_PROTO_PCIE_NBARS];
+    bool bar_change = false;
+    size_t i;
 
     intx_before = !pci_irq_disabled(dev);
     msi_before = msi_enabled(dev);
     msix_before = msix_enabled(dev);
+
+    for (i = 0; i < SIMBRICKS_PROTO_PCIE_NBARS; i++) {
+        pcibus_t addr = pci_get_bar_addr(&simbricks->pdev, i);
+        bars_before[i] = addr;
+    }
 
     pci_default_write_config(dev, address, val, len);
 
@@ -599,21 +608,50 @@ static void simbricks_config_write(PCIDevice *dev,
     msi_after = msi_enabled(dev);
     msix_after = msix_enabled(dev);
 
-    if (intx_before != intx_after || msi_before != msi_after ||
-            msix_before != msix_after)
-    {
+    for (i = 0; i < SIMBRICKS_PROTO_PCIE_NBARS; i++) {
+        pcibus_t addr = pci_get_bar_addr(&simbricks->pdev, i);
+        bars_after[i] = addr;
+        if (bars_before[i] != bars_after[i]) {
+            bar_change = true;
+        }
+    }
+
+    if (intx_before == intx_after && msi_before == msi_after &&
+            msix_before == msix_after && !bar_change) {
+        return;
+    }
+
+    if (intx_after)
+        devctrl.flags |= SIMBRICKS_PROTO_PCIE_CTRL_INTX_EN;
+    if (msi_after)
+        devctrl.flags |= SIMBRICKS_PROTO_PCIE_CTRL_MSI_EN;
+    if (msix_after)
+        devctrl.flags |= SIMBRICKS_PROTO_PCIE_CTRL_MSIX_EN;
+
+    if (!bar_change) {
+        msg = simbricks_comm_h2d_alloc(simbricks,
+                                        qemu_clock_get_ns(SIMBRICKS_CLOCK));
+        msg->devctrl = devctrl;
+        SimbricksPcieIfH2DOutSend(&simbricks->pcieif, msg,
+            SIMBRICKS_PROTO_PCIE_H2D_MSG_DEVCTRL);
+        return;
+    }
+
+    for (i = 0; i < SIMBRICKS_PROTO_PCIE_NBARS; i++) {
+        if (bars_before[i] == bars_after[i]) {
+            continue;
+        }
+
         msg = simbricks_comm_h2d_alloc(simbricks,
                                        qemu_clock_get_ns(SIMBRICKS_CLOCK));
-        devctrl = &msg->devctrl;
 
-        devctrl->flags = 0;
-        if (intx_after)
-            devctrl->flags |= SIMBRICKS_PROTO_PCIE_CTRL_INTX_EN;
-        if (msi_after)
-            devctrl->flags |= SIMBRICKS_PROTO_PCIE_CTRL_MSI_EN;
-        if (msix_after)
-            devctrl->flags |= SIMBRICKS_PROTO_PCIE_CTRL_MSIX_EN;
+        devctrl.bar_size = simbricks->dev_intro.bars[i].len;
+        devctrl.bar_addr = bars_after[i];
+        devctrl.bar = i;
+        fprintf(stderr, "simbricks_config_write: bar %zu changed to %lx (len: %lx)\n",
+                i, devctrl.bar_addr, devctrl.bar_size);
 
+        msg->devctrl = devctrl;
         SimbricksPcieIfH2DOutSend(&simbricks->pcieif, msg,
             SIMBRICKS_PROTO_PCIE_H2D_MSG_DEVCTRL);
     }
@@ -757,7 +795,7 @@ static void pci_simbricks_realize(PCIDevice *pdev, Error **errp)
         }
     }
 
-    for (i = 0; i < 6; i++) {
+    for (i = 0; i < SIMBRICKS_PROTO_PCIE_NBARS; i++) {
         len = simbricks->dev_intro.bars[i].len;
         flags = simbricks->dev_intro.bars[i].flags;
 
