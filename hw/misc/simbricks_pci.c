@@ -648,8 +648,6 @@ static void simbricks_config_write(PCIDevice *dev,
         devctrl.bar_size = simbricks->dev_intro.bars[i].len;
         devctrl.bar_addr = bars_after[i];
         devctrl.bar = i;
-        fprintf(stderr, "simbricks_config_write: bar %zu changed to %lx (len: %lx)\n",
-                i, devctrl.bar_addr, devctrl.bar_size);
 
         msg->devctrl = devctrl;
         SimbricksPcieIfH2DOutSend(&simbricks->pcieif, msg,
