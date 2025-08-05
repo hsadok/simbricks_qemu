@@ -165,7 +165,12 @@ static void simbricks_comm_d2h_dma_read(
         SimbricksPcieIfH2DOutMsgLen(&simbricks->pcieif) - sizeof (*rc));
 
     /* perform dma read */
-    pci_dma_read(&simbricks->pdev, read->offset, (void *) rc->data, read->len);
+    MemTxResult result = pci_dma_read(&simbricks->pdev, read->offset,
+            (void *) rc->data, read->len);
+    if (result != MEMTX_OK) {
+        warn_report("simbricks_comm_d2h_dma_read: dma read failed: %d", result);
+        abort();
+    }
 
     /* return completion */
     rc->req_id = read->req_id;
