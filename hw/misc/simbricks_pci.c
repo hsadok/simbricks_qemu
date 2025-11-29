@@ -25,7 +25,9 @@
 
 #include "qemu/osdep.h"
 #include "qemu/units.h"
+#include "qemu/host-utils.h"
 #include "hw/pci/pci.h"
+#include "hw/pci/pcie.h"
 #include "hw/qdev-properties.h"
 #include "hw/hw.h"
 #include "hw/pci/msi.h"
@@ -144,6 +146,28 @@ static inline volatile union SimbricksProtoPcieH2D *simbricks_comm_h2d_alloc(
     // whenever we send a message, we need to reschedule our sync timer
     simbricks->sync_ts_bumped = true;
     return msg;
+}
+
+static void simbricks_set_max_payload_cap(PCIDevice *pdev, uint8_t max_payload)
+{
+    // Max payload size will be ((1 << max_payload) * 128) bytes.
+    const uint32_t payload_code = max_payload;
+
+    if (!pci_is_express(pdev) || !pdev->exp.exp_cap) {
+        return;
+    }
+
+    uint8_t *exp_cap = pdev->config + pdev->exp.exp_cap;
+    uint32_t devcap = pci_get_long(exp_cap + PCI_EXP_DEVCAP);
+    uint16_t devctl = pci_get_word(exp_cap + PCI_EXP_DEVCTL);
+
+    devcap &= ~PCI_EXP_DEVCAP_PAYLOAD;
+    devcap |= payload_code;
+    pci_set_long(exp_cap + PCI_EXP_DEVCAP, devcap);
+
+    devctl &= ~PCI_EXP_DEVCTL_PAYLOAD;
+    devctl |= (payload_code << ctz32(PCI_EXP_DEVCTL_PAYLOAD));
+    pci_set_word(exp_cap + PCI_EXP_DEVCTL, devctl);
 }
 
 /******************************************************************************/
@@ -790,6 +814,15 @@ static void pci_simbricks_realize(PCIDevice *pdev, Error **errp)
     }
 
     pci_config_set_interrupt_pin(pci_conf, 1);
+
+    pdev->cap_present |= QEMU_PCI_CAP_EXPRESS;
+    if (pcie_endpoint_cap_init(pdev, 0) < 0) {
+        error_setg(errp, "failed to initialize PCIe capability");
+        return;
+    }
+    simbricks_set_max_payload_cap(pdev,
+                                  simbricks->dev_intro.pci_cap_max_payload);
+
     if (simbricks->dev_intro.pci_msi_nvecs > 0) {
         if (msi_init(pdev, 0, simbricks->dev_intro.pci_msi_nvecs, true, false,
                     errp))
@@ -934,6 +967,7 @@ static void simbricks_pci_class_init(ObjectClass *class, void *data)
 static void pci_simbricks_register_types(void)
 {
     static InterfaceInfo interfaces[] = {
+        { INTERFACE_PCIE_DEVICE },
         { INTERFACE_CONVENTIONAL_PCI_DEVICE },
         { },
     };
