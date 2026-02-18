@@ -62,6 +62,28 @@ static void xio3130_downstream_reset(DeviceState *qdev)
     pci_bridge_reset(qdev);
 }
 
+static void xio3130_set_max_payload_cap(PCIDevice *d, uint8_t max_payload)
+{
+    // Max payload size will be ((1 << max_payload) * 128) bytes.
+    const uint32_t payload_code = max_payload;
+
+    if (!pci_is_express(d) || !d->exp.exp_cap) {
+        return;
+    }
+
+    uint8_t *exp_cap = d->config + d->exp.exp_cap;
+    uint32_t devcap = pci_get_long(exp_cap + PCI_EXP_DEVCAP);
+    uint16_t devctl = pci_get_word(exp_cap + PCI_EXP_DEVCTL);
+
+    devcap &= ~PCI_EXP_DEVCAP_PAYLOAD;
+    devcap |= payload_code;
+    pci_set_long(exp_cap + PCI_EXP_DEVCAP, devcap);
+
+    devctl &= ~PCI_EXP_DEVCTL_PAYLOAD;
+    devctl |= (payload_code << ctz32(PCI_EXP_DEVCTL_PAYLOAD));
+    pci_set_word(exp_cap + PCI_EXP_DEVCTL, devctl);
+}
+
 static void xio3130_downstream_realize(PCIDevice *d, Error **errp)
 {
     PCIEPort *p = PCIE_PORT(d);
@@ -96,6 +118,8 @@ static void xio3130_downstream_realize(PCIDevice *d, Error **errp)
     pcie_cap_deverr_init(d);
     pcie_cap_slot_init(d, s);
     pcie_cap_arifwd_init(d);
+
+    xio3130_set_max_payload_cap(d, 0x4);  // 2048 bytes.
 
     pcie_chassis_create(s->chassis);
     rc = pcie_chassis_add_slot(s);
