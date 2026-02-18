@@ -326,7 +326,7 @@ static void simbricks_comm_d2h_process(
             break;
 
         default:
-            panic("simbricks_comm_poll_d2h: unhandled type");
+            panic("simbricks_comm_poll_d2h: unhandled type: %u", type);
     }
 
     SimbricksPcieIfD2HInDone(&simbricks->pcieif, msg);
