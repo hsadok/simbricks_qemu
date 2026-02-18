@@ -42,6 +42,8 @@
 #include "sysemu/cpus.h"
 #include "hw/core/cpu.h"
 
+#include <immintrin.h>
+
 #include <simbricks/pcie/if.h>
 
 //#define DEBUG_PRINTS
@@ -202,6 +204,33 @@ static void simbricks_comm_d2h_dma_read(
         SIMBRICKS_PROTO_PCIE_H2D_MSG_READCOMP);
 }
 
+// Adapted from DPDK's rte_mov64() and rte_memcpy() functions.
+__attribute__((target("avx512f")))
+static void mov64(uint8_t* dst, const uint8_t* src) {
+  __m512i zmm0;
+  zmm0 = _mm512_loadu_si512((const void*)src);
+  _mm512_storeu_si512((void*)dst, zmm0);
+}
+
+/**
+ * @brief Copies data from src to dst.
+ *
+ * @param dst Destination address.
+ * @param src Source address.
+ * @param n 64-byte aligned number of bytes to copy.
+ */
+__attribute__((target("avx512f")))
+static void memcpy_64_align(void* dst, const void* src, size_t n) {
+  // Check that it is aligned to 64 bytes.
+  assert(((uint64_t)dst & 0x3f) == 0);
+
+  for (; n >= 64; n -= 64) {
+    mov64((uint8_t*)dst, (const uint8_t*)src);
+    dst = (uint8_t*)dst + 64;
+    src = (const uint8_t*)src + 64;
+  }
+}
+
 static void simbricks_comm_d2h_dma_write(
         SimbricksPciState *simbricks,
         int64_t ts,
@@ -215,8 +244,34 @@ static void simbricks_comm_d2h_dma_write(
     wc = &h2d->writecomp;
 
     /* perform dma write */
-    pci_dma_write(&simbricks->pdev, write->offset, (void *) write->data,
-            write->len);
+    /* try atomic 64B write if possible */
+    void *host_ptr = NULL;
+    if (write->len % 64 == 0 && write->offset % 64 == 0) {
+        uint64_t len = write->len;
+        host_ptr = dma_memory_map(pci_get_address_space(&simbricks->pdev),
+                                        write->offset, &len,
+                                        DMA_DIRECTION_FROM_DEVICE);
+        if (host_ptr && len >= write->len) {
+            memcpy_64_align(host_ptr, (void *) write->data, write->len);
+            _mm_sfence();
+            dma_memory_unmap(pci_get_address_space(&simbricks->pdev),
+                            host_ptr, len,
+                            DMA_DIRECTION_FROM_DEVICE, write->len);
+        } else {
+            if (host_ptr) {
+                dma_memory_unmap(pci_get_address_space(&simbricks->pdev),
+                                host_ptr, len,
+                                DMA_DIRECTION_FROM_DEVICE, 0);
+            }
+            host_ptr = NULL;
+        }
+    }
+    
+    if (!host_ptr) {
+        /* Fallback: non-atomic, but handles MMIO or bounce buffers */
+        pci_dma_write(&simbricks->pdev, write->offset, (void *) write->data,
+                      write->len);
+    }
 
     /* return completion */
     wc->req_id = write->req_id;
