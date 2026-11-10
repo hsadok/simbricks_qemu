@@ -43,6 +43,11 @@
 #include "hw/core/cpu.h"
 
 #include <immintrin.h>
+#include <sys/prctl.h>
+
+/* unsync poll thread keeps spinning this long after the last message before
+ * it starts sleeping (only with poll-sleep-max-us > 0) */
+#define SIMBRICKS_POLL_SPIN_NS (200 * 1000)
 
 #include <simbricks/pcie/if.h>
 
@@ -82,6 +87,10 @@ typedef struct SimbricksPciState {
     char *socket_path;      /* path to ux socket to connect to */
     uint64_t pci_latency;
     uint64_t sync_period;
+    /* unsync poll thread: once idle for SIMBRICKS_POLL_SPIN_NS, sleep with
+     * exponential backoff up to this many us between polls. 0 = always spin
+     * (one core per device). */
+    uint32_t poll_sleep_max_us;
 
     MemoryRegion mmio_bars[6];
     SimbricksPciBarInfo bar_info[6];
@@ -490,16 +499,43 @@ static void *simbricks_poll_thread(void *opaque)
     SimbricksPciState *simbricks = opaque;
     volatile union SimbricksProtoPcieD2H *msg;
 
+    const uint32_t sleep_max_us = simbricks->poll_sleep_max_us;
+    int64_t idle_since = 0;
+    uint32_t sleep_us = 0;
+
     assert(!simbricks->sync);
+
+    if (sleep_max_us) {
+        /* default 50 us timer slack would swamp short sleeps */
+        prctl(PR_SET_TIMERSLACK, 1000UL);
+    }
 
     while (!simbricks->stopping) {
         msg = SimbricksPcieIfD2HInPoll(&simbricks->pcieif, 0);
-        if (!msg)
+        if (!msg) {
+            if (!sleep_max_us)
+                continue;
+            int64_t now = get_clock_realtime();
+            if (!idle_since)
+                idle_since = now;
+            if (now - idle_since < SIMBRICKS_POLL_SPIN_NS)
+                continue;
+            sleep_us = sleep_us ? MIN(sleep_us * 2, sleep_max_us) : 1;
+            g_usleep(sleep_us);
             continue;
+        }
+        idle_since = 0;
+        sleep_us = 0;
 
         /* actually process the operation. this needs to be done with the I/O
          * lock held. */
         qemu_mutex_lock_iothread();
+        if (simbricks->stopping) {
+            /* pci_simbricks_uninit() dropped the lock to join us; the device
+             * is being torn down, so do not touch it. */
+            qemu_mutex_unlock_iothread();
+            break;
+        }
         simbricks_comm_d2h_process(simbricks, 0, msg);
         qemu_mutex_unlock_iothread();
     }
@@ -961,7 +997,18 @@ static void pci_simbricks_uninit(PCIDevice *pdev)
 
     if (!simbricks->sync) {
         simbricks->stopping = true;
+        /* The poll thread takes the iothread lock to process a message. When
+         * called from qemu_cleanup() we hold that lock, so joining with it
+         * held deadlocks if the thread is waiting for it (QEMU then never
+         * exits). Drop it for the join. */
+        bool locked = qemu_mutex_iothread_locked();
+        if (locked) {
+            qemu_mutex_unlock_iothread();
+        }
         qemu_thread_join(&simbricks->thread);
+        if (locked) {
+            qemu_mutex_lock_iothread();
+        }
     }
 
     CPU_FOREACH(cpu) {
@@ -995,6 +1042,8 @@ static Property simbricks_pci_dev_properties[] = {
       SIMBRICKS_PROTO_SYNC_SIMBRICKS),
   DEFINE_PROP_UINT64("pci-latency", SimbricksPciState, pci_latency, 500),
   DEFINE_PROP_UINT64("sync-period", SimbricksPciState, sync_period, 500),
+  DEFINE_PROP_UINT32("poll-sleep-max-us", SimbricksPciState,
+      poll_sleep_max_us, 0),
   DEFINE_PROP_END_OF_LIST(),
 };
 
